@@ -1,0 +1,90 @@
+name: QuillShield CI Scan
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    # GitHub withholds repository secrets from fork PR workflows. The App can scan them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Start CI Scan and wait for report
+        env:
+          API_URL: "https://api-test-3658.up.railway.app"
+          PROJECT_ID: "01M2CFMXMPTQ9PFYYB8MR0CGGZ"
+          API_KEY: ${{ secrets.QUILLAUDITS_API_KEY }}
+          ORG_ID: ${{ secrets.QUILLAUDITS_ORG_ID }}
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, time, urllib.request
+          from urllib.error import HTTPError
+          if not os.environ.get("API_KEY") or not os.environ.get("ORG_ID"):
+              raise SystemExit("Set QUILLAUDITS_API_KEY and QUILLAUDITS_ORG_ID in Actions secrets")
+          def api(path, body=None):
+              request = urllib.request.Request(os.environ["API_URL"] + "/v1" + path,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Authorization": "Bearer " + os.environ["API_KEY"],
+                      "X-Org-Id": os.environ["ORG_ID"], "X-QuillShield-Client": "ci",
+                      "Content-Type": "application/json"})
+              for attempt in range(6):
+                  try:
+                      with urllib.request.urlopen(request, timeout=120) as response:
+                          return json.load(response)
+                  except HTTPError as error:
+                      if error.code == 503 and attempt < 5:
+                          time.sleep(5)
+                          continue
+                      raise SystemExit("CI Scan request failed: " + error.read().decode())
+          with open(os.environ["GITHUB_EVENT_PATH"]) as source:
+              event = json.load(source)
+          common = {"project_id": os.environ["PROJECT_ID"]}
+          if "pull_request" in event:
+              pull = event["pull_request"]
+              targets = [{"pull_request_number": pull["number"], "head_sha": pull["head"]["sha"]}]
+          else:
+              commits = [c["id"] for c in event.get("commits", [])]
+              if len(commits) >= 2048 or event.get("size", len(commits)) > len(commits):
+                  before, after = event.get("before", ""), event.get("after", "")
+                  if not before.strip("0"):
+                      raise SystemExit("GitHub omitted commits from a new-branch push; run a Full Audit before relying on CI coverage")
+                  commits, page = [], 1
+                  while True:
+                      url = os.environ["GITHUB_API_URL"] + "/repos/" + os.environ["GITHUB_REPOSITORY"] + "/compare/" + before + "..." + after + "?per_page=100&page=" + str(page)
+                      request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["GITHUB_READ_TOKEN"], "Accept": "application/vnd.github+json"})
+                      with urllib.request.urlopen(request, timeout=120) as response:
+                          comparison = json.load(response)
+                      batch, total = comparison.get("commits"), comparison.get("total_commits")
+                      if not isinstance(batch, list) or not isinstance(total, int):
+                          raise SystemExit("GitHub returned an incomplete pushed commit range")
+                      previous = len(commits)
+                      commits = list(dict.fromkeys(commits + [c["sha"] for c in batch]))
+                      if len(commits) >= total:
+                          break
+                      if len(commits) == previous:
+                          raise SystemExit("GitHub did not return every pushed commit")
+                      page += 1
+              commits.append(event.get("after", os.environ["GITHUB_SHA"]))
+              targets = [{"head_sha": sha, "branch": os.environ["GITHUB_REF_NAME"]}
+                         for sha in dict.fromkeys(commits) if sha.strip("0")]
+          jobs = [api("/ci/scans/trigger", {**common, **target}) for target in targets]
+          deadline = time.time() + 80 * 60
+          for job in jobs:
+              while job["status"] not in ("completed", "failed", "cancelled"):
+                  if time.time() > deadline:
+                      raise SystemExit("Timed out waiting for CI Scan " + job["id"])
+                  time.sleep(10)
+                  job = api("/audits/" + job["id"])
+              conclusion = job.get("security_conclusion") or job["status"]
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  summary.write("CI Scan " + job["id"] + ": " + conclusion + "\n")
+              if job["status"] != "completed" or conclusion != "passed":
+                  raise SystemExit("CI Scan needs attention: " + conclusion)
+          PYTHON
